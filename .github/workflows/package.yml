@@ -1,0 +1,47 @@
+name: Package Extension
+
+on:
+  push:
+    branches:
+      - main  # 或者你的主分支名称，如 master
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. 拉取代码
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. 设置 Node.js 环境
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+
+      # 3. 安装依赖
+      - name: Install dependencies
+        run: npm install
+
+      # 4. 编译 TypeScript (生成 out 目录)
+      - name: Compile
+        run: npm run compile
+
+      # 5. 打包 VSIX 文件
+      # 使用 npx 直接运行 vsce，不需要全局安装
+      # --no-dependencies 跳过部分生产环境依赖检查
+      - name: Package Extension
+        run: npx @vscode/vsce package -o only-agent.vsix
+
+      # 6. 上传生成的 VSIX 文件到 Artifacts
+      # 这样你可以在 GitHub Actions 的运行结果页面直接下载它
+      - name: Upload VSIX
+        uses: actions/upload-artifact@v4
+        with:
+          name: only-agent-vsix
+          path: only-agent.vsix

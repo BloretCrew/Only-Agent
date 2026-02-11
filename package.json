@@ -1,5 +1,6 @@
 {
   "name": "only-agent",
+  "publisher": "Bloret",
   "displayName": "Manual AI Agent",
   "description": "类似 Github Copilot 的手动 AI 助手",
   "version": "0.0.2",
