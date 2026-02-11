@@ -110,33 +110,57 @@ User Request: ${userInstruction}`;
 
     private async parseAndConfirmActions(aiResponse: string) {
         this._pendingActions = [];
-        const actionRegex = /{{TOOL_CALL:(\w+)}}([\s\S]*?)(?={{TOOL_CALL:|$)/g;
+        // 允许标签前后有空格
+        const actionRegex = /{{\s*TOOL_CALL:\s*(\w+)\s*}}([\s\S]*?)(?={{\s*TOOL_CALL:|$)/g;
         let match;
+        let foundAny = false;
 
         while ((match = actionRegex.exec(aiResponse)) !== null) {
+            foundAny = true;
             const type = match[1];
             const body = match[2];
             const id = Math.random().toString(36).substring(7);
 
             const action: AgentAction = { id, type: type as any };
 
+            // 更加宽松的提取逻辑，允许 AI 使用 **FILE:** 这种加粗格式，并忽略代码块标记后的后缀
+            const getField = (body: string, field: string) => {
+                const reg = new RegExp(`(?:\\*\\*)?${field}:(?:\\*\\*)?\\s*(.*)`, 'i');
+                return body.match(reg)?.[1]?.trim();
+            };
+
+            const getCodeBlock = (body: string, field: string) => {
+                const reg = new RegExp(`(?:\\*\\*)?${field}:(?:\\*\\*)?\\s*[\\s\\S]*?\`\`\`[\\w]*\\n?([\\s\\S]*?)\\n?\`\`\``, 'i');
+                return body.match(reg)?.[1];
+            };
+
             if (type === 'MODIFY') {
-                action.path = body.match(/FILE:\s*(.*)/)?.[1].trim();
-                action.before = body.match(/BEFORE:\s*```.*\n([\s\S]*?)\n```/)?.[1];
-                action.content = body.match(/AFTER:\s*```.*\n([\s\S]*?)\n```/)?.[1];
+                action.path = getField(body, 'FILE');
+                action.before = getCodeBlock(body, 'BEFORE');
+                action.content = getCodeBlock(body, 'AFTER');
             } else if (type === 'CREATE') {
-                action.path = body.match(/FILE:\s*(.*)/)?.[1].trim();
-                action.content = body.match(/CONTENT:\s*```.*\n([\s\S]*?)\n```/)?.[1];
+                action.path = getField(body, 'FILE');
+                action.content = getCodeBlock(body, 'CONTENT');
             } else if (type === 'DELETE') {
-                action.path = body.match(/FILE:\s*(.*)/)?.[1].trim();
+                action.path = getField(body, 'FILE');
             } else if (type === 'SHELL') {
-                action.command = body.match(/COMMAND:\s*(.*)/)?.[1].trim();
+                action.command = getField(body, 'COMMAND');
             } else if (type === 'FETCH') {
-                action.url = body.match(/URL:\s*(.*)/)?.[1].trim();
+                action.url = getField(body, 'URL');
             }
 
-            this._pendingActions.push(action);
-            this._view?.webview.postMessage({ type: 'renderAction', action });
+            if (action.type) {
+                this._pendingActions.push(action);
+                this._view?.webview.postMessage({ type: 'renderAction', action });
+            }
+        }
+
+        if (!foundAny) {
+            this._view?.webview.postMessage({ 
+                type: 'addMessage', 
+                role: 'error', 
+                text: '❌ 未识别到任何有效的 TOOL_CALL 指令。请确保 AI 的回复包含类似 {{TOOL_CALL:MODIFY}} 的标签。' 
+            });
         }
     }
 
