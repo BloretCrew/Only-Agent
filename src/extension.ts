@@ -4,7 +4,8 @@ import * as path from 'path';
 export function activate(context: vscode.ExtensionContext) {
     const provider = new ManualAIChatViewProvider(context.extensionUri);
     context.subscriptions.push(
-        vscode.window.registerWebviewViewProvider('Only-Agent.chatView', provider)
+        vscode.window.registerWebviewViewProvider('Only-Agent.chatView', provider),
+        vscode.commands.registerCommand('only-agent.clearHistory', () => provider.clearChat())
     );
 }
 
@@ -18,12 +19,24 @@ interface AgentAction {
     url?: string;
 }
 
+interface ChatMessage {
+    role: 'user' | 'ai' | 'system' | 'error' | 'action';
+    text: string;
+    action?: AgentAction;
+}
+
 class ManualAIChatViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'Only-Agent.chatView';
     private _view?: vscode.WebviewView;
     private _pendingActions: AgentAction[] = [];
+    private _chatHistory: ChatMessage[] = [];
 
-    constructor(private readonly _extensionUri: vscode.Uri) { }
+    constructor(private readonly _extensionUri: vscode.Uri) { 
+        this._chatHistory.push({ 
+            role: 'system', 
+            text: '欢迎使用 Manual AI Agent。<br>1. 输入需求并点击 "Copy Prompt"。<br>2. 粘贴 AI 回复并点击 "Apply Changes"。' 
+        });
+    }
 
     public resolveWebviewView(webviewView: vscode.WebviewView) {
         this._view = webviewView;
@@ -32,20 +45,64 @@ class ManualAIChatViewProvider implements vscode.WebviewViewProvider {
 
         webviewView.webview.onDidReceiveMessage(async (data) => {
             switch (data.type) {
-                case 'copyPrompt': await this.handleCopyPrompt(data.inputValue); break;
-                case 'applyChange': await this.parseAndConfirmActions(data.inputValue); break;
-                case 'approveAction': await this.executeAction(data.actionId); break;
-                case 'approveAll': await this.handleApproveAll(); break;
+                case 'copyPrompt': 
+                    await this.handleCopyPrompt(data.inputValue, data.options); 
+                    break;
+                case 'applyChange': 
+                    await this.parseAndConfirmActions(data.inputValue); 
+                    break;
+                case 'approveAction': 
+                    await this.executeAction(data.actionId); 
+                    break;
+                case 'approveAll': 
+                    await this.handleApproveAll(); 
+                    break;
+                case 'ready':
+                    this.restoreHistory();
+                    break;
             }
         });
     }
 
+    public clearChat() {
+        this._chatHistory = [];
+        this._pendingActions = [];
+        this._view?.webview.postMessage({ type: 'clearChat' });
+        this._chatHistory.push({ role: 'system', text: '🗑️ 历史记录已清空。' });
+        this.restoreHistory();
+    }
+
+    private restoreHistory() {
+        if (this._view) {
+            this._view.webview.postMessage({ type: 'restoreHistory', history: this._chatHistory });
+            if (this._pendingActions.length > 0) {
+                this._view.webview.postMessage({ type: 'toggleApproveAll', show: true });
+            }
+        }
+    }
+
+    private addToHistory(message: ChatMessage) {
+        this._chatHistory.push(message);
+        this._view?.webview.postMessage({ type: 'addMessage', message });
+    }
+
     private async handleApproveAll() {
-        const actionIds = this._pendingActions.map(a => a.id);
+        const safeActions = this._pendingActions.filter(a => a.type !== 'SHELL');
+        const skippedCount = this._pendingActions.length - safeActions.length;
+        
+        const actionIds = safeActions.map(a => a.id);
         for (const id of actionIds) {
             await this.executeAction(id);
         }
-        this._view?.webview.postMessage({ type: 'toggleApproveAll', show: false });
+        
+        if (skippedCount > 0) {
+            this.addToHistory({ role: 'system', text: `⚠️ 已跳过 ${skippedCount} 个终端命令 (Approve All 不包含终端指令)。` });
+        }
+
+        const remaining = this._pendingActions.filter(a => !actionIds.includes(a.id));
+        if (remaining.length === 0 || remaining.every(a => a.type === 'SHELL')) {
+            this._view?.webview.postMessage({ type: 'toggleApproveAll', show: false });
+        }
     }
 
     private async getProjectStructure(): Promise<string> {
@@ -60,13 +117,26 @@ class ManualAIChatViewProvider implements vscode.WebviewViewProvider {
         return structure;
     }
 
-    private async handleCopyPrompt(userInstruction: string) {
-        const structure = await this.getProjectStructure();
-        // 获取所有打开的编辑器内容
-        let openFilesContext = "";
-        for (const doc of vscode.workspace.textDocuments) {
-            if (!doc.fileName.includes('node_modules')) {
-                openFilesContext += `\nFile: ${doc.fileName}\n\`\`\`\n${doc.getText()}\n\`\`\`\n`;
+    private async handleCopyPrompt(userInstruction: string, options: { includeStructure: boolean, includeOpenFiles: boolean }) {
+        let contextText = "";
+        let logMsg = "✅ 已复制 Prompt";
+
+        if (options.includeStructure) {
+            const structure = await this.getProjectStructure();
+            contextText += `项目结构：\n${structure}\n\n`;
+            logMsg += " (含项目结构)";
+        }
+
+        if (options.includeOpenFiles) {
+            let openFilesContext = "";
+            for (const doc of vscode.workspace.textDocuments) {
+                if (!doc.fileName.includes('node_modules') && doc.uri.scheme === 'file') {
+                    openFilesContext += `\nFile: ${doc.fileName}\n\`\`\`\n${doc.getText()}\n\`\`\`\n`;
+                }
+            }
+            if (openFilesContext) {
+                contextText += `当前打开的文件内容：\n${openFilesContext}\n\n`;
+                logMsg += " (含打开文件)";
             }
         }
 
@@ -105,20 +175,15 @@ COMMAND: 指令内容
 {{TOOL_CALL:FETCH}}
 URL: 请求地址
 
-项目结构：
-${structure}
-
-当前打开的文件内容：
-${openFilesContext}
-
-User Request: ${userInstruction}`;
+${contextText}User Request: ${userInstruction}`;
 
         await vscode.env.clipboard.writeText(prompt);
-        this._view?.webview.postMessage({ type: 'addMessage', role: 'system', text: '✅ 已复制项目结构、打开的文件及 Prompt。' });
+        this.addToHistory({ role: 'system', text: logMsg });
     }
 
     private async parseAndConfirmActions(aiResponse: string) {
-        // 不清空之前的，保留历史动作意识，但通常 apply 一次就是一个批次
+        this.addToHistory({ role: 'ai', text: aiResponse });
+
         const currentBatch: AgentAction[] = [];
         const actionRegex = /{{\s*TOOL_CALL:\s*(\w+)\s*}}([\s\S]*?)(?={{\s*TOOL_CALL:|$)/g;
         let match;
@@ -156,18 +221,14 @@ User Request: ${userInstruction}`;
             if (action.type) {
                 currentBatch.push(action);
                 this._pendingActions.push(action);
-                this._view?.webview.postMessage({ type: 'renderAction', action });
+                this.addToHistory({ role: 'action', text: '', action });
             }
         }
 
         if (currentBatch.length > 0) {
             this._view?.webview.postMessage({ type: 'toggleApproveAll', show: true });
         } else {
-            this._view?.webview.postMessage({ 
-                type: 'addMessage', 
-                role: 'error', 
-                text: '❌ 未识别到有效的 TOOL_CALL 指令。' 
-            });
+            this.addToHistory({ role: 'error', text: '❌ 未识别到有效的 TOOL_CALL 指令。' });
         }
     }
 
@@ -188,6 +249,8 @@ User Request: ${userInstruction}`;
                     const offset = fullText.indexOf(action.before!);
                     if (offset !== -1) {
                         await editor.edit(e => e.replace(new vscode.Range(doc.positionAt(offset), doc.positionAt(offset + action.before!.length)), action.content!));
+                    } else {
+                        throw new Error("找不到原文块，无法修改。");
                     }
                     break;
                 case 'CREATE':
@@ -207,24 +270,29 @@ User Request: ${userInstruction}`;
                     if (action.url) vscode.env.openExternal(vscode.Uri.parse(action.url));
                     break;
             }
+            
             this._pendingActions.splice(index, 1);
             this._view?.webview.postMessage({ type: 'actionComplete', actionId });
             
-            if (this._pendingActions.length === 0) {
+            const remainingNonShell = this._pendingActions.filter(a => a.type !== 'SHELL');
+            if (remainingNonShell.length === 0) {
                 this._view?.webview.postMessage({ type: 'toggleApproveAll', show: false });
             }
+
         } catch (e: any) {
+            this._view?.webview.postMessage({ type: 'actionError', actionId, error: e.message });
             vscode.window.showErrorMessage(`执行失败: ${e.message}`);
         }
     }
 
-    // --- HTML/CSS/JS 构建 ---
     private _getHtmlForWebview(webview: vscode.Webview) {
         return `<!DOCTYPE html>
         <html lang="en">
         <head>
             <meta charset="UTF-8">
+            <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline' https://cdn.jsdelivr.net; script-src 'unsafe-inline' https://cdn.jsdelivr.net; img-src https: data:;">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"><\/script>
             <style>
                 body {
                     padding: 0;
@@ -237,7 +305,6 @@ User Request: ${userInstruction}`;
                     height: 100vh;
                 }
                 
-                /* 聊天记录区域 */
                 #chat-history {
                     flex: 1;
                     overflow-y: auto;
@@ -250,11 +317,16 @@ User Request: ${userInstruction}`;
                 .message {
                     padding: 8px 12px;
                     border-radius: 6px;
-                    max-width: 90%;
+                    max-width: 95%;
                     word-wrap: break-word;
                     font-size: 13px;
-                    line-height: 1.4;
+                    line-height: 1.5;
                 }
+                
+                .message p { margin: 0 0 8px 0; }
+                .message p:last-child { margin: 0; }
+                .message pre { background: var(--vscode-textBlockQuote-background); padding: 5px; overflow-x: auto; border-radius: 4px; }
+                .message code { font-family: var(--vscode-editor-font-family); font-size: 0.9em; }
 
                 .message.user {
                     align-self: flex-end;
@@ -272,6 +344,7 @@ User Request: ${userInstruction}`;
                     font-style: italic;
                     color: var(--vscode-descriptionForeground);
                     font-size: 12px;
+                    text-align: center;
                 }
                 
                 .message.error {
@@ -279,17 +352,41 @@ User Request: ${userInstruction}`;
                     background-color: var(--vscode-inputValidation-errorBackground);
                     border: 1px solid var(--vscode-inputValidation-errorBorder);
                 }
+                
+                .action-error-text {
+                    color: var(--vscode-errorForeground);
+                    font-size: 12px;
+                    margin-top: 5px;
+                    font-weight: bold;
+                }
 
-                /* 底部输入区域 */
                 #input-area {
                     padding: 10px;
                     border-top: 1px solid var(--vscode-panel-border);
                     background-color: var(--vscode-sideBar-background);
                 }
 
+                .context-controls {
+                    display: flex;
+                    gap: 10px;
+                    margin-bottom: 5px;
+                    font-size: 11px;
+                    color: var(--vscode-descriptionForeground);
+                }
+
+                .context-controls label {
+                    display: flex;
+                    align-items: center;
+                    cursor: pointer;
+                }
+                
+                .context-controls input {
+                    margin-right: 4px;
+                }
+
                 textarea {
                     width: 100%;
-                    height: 80px;
+                    height: 70px;
                     resize: vertical;
                     background-color: var(--vscode-input-background);
                     color: var(--vscode-input-foreground);
@@ -328,6 +425,11 @@ User Request: ${userInstruction}`;
                 #btn-apply {
                     background-color: var(--vscode-button-background);
                 }
+                
+                #btn-approve-all {
+                    background-color: var(--vscode-statusBarItem-warningBackground);
+                    color: white;
+                }
 
                 button:hover {
                     opacity: 0.9;
@@ -335,44 +437,56 @@ User Request: ${userInstruction}`;
             </style>
         </head>
         <body>
-            <div id="chat-history">
-                <div class="message system">欢迎使用 Manual AI Agent。<br>1. 输入需求并点击 "Copy Prompt"。<br>2. 粘贴 AI 回复并点击 "Apply Changes"。</div>
-            </div>
+            <div id="chat-history"><\/div>
             
             <div id="input-area">
                 <div id="global-actions" style="display: none; padding-bottom: 8px;">
-                    <button id="btn-approve-all" style="background-color: var(--vscode-statusBarItem-warningBackground); color: white; width: 100%;">全部批准执行 (Approve All)</button>
-                </div>
-                <textarea id="prompt-input" placeholder="输入需求或粘贴 AI 回复..."></textarea>
+                    <button id="btn-approve-all" style="width: 100%;">批准并执行所有非终端指令 (Approve All)<\/button>
+                <\/div>
+                
+                <div class="context-controls">
+                    <span>包含上下文:<\/span>
+                    <label><input type="checkbox" id="chk-structure" checked> 项目结构<\/label>
+                    <label><input type="checkbox" id="chk-files" checked> 打开的文件<\/label>
+                <\/div>
+
+                <textarea id="prompt-input" placeholder="输入需求或粘贴 AI 回复..."><\/textarea>
                 <div class="button-group">
-                    <button id="btn-copy">Copy Prompt</button>
-                    <button id="btn-apply">Apply Changes</button>
-                </div>
-            </div>
+                    <button id="btn-copy">Copy Prompt<\/button>
+                    <button id="btn-apply">Apply Changes<\/button>
+                <\/div>
+            <\/div>
 
             <script>
                 const vscode = acquireVsCodeApi();
                 const chatHistory = document.getElementById('chat-history');
                 const promptInput = document.getElementById('prompt-input');
                 const globalActions = document.getElementById('global-actions');
+                
+                vscode.postMessage({ type: 'ready' });
 
                 window.addEventListener('message', event => {
-                    const message = event.data;
-                    if (message.type === 'addMessage') {
-                        addMessage(message.role, message.text);
-                    } else if (message.type === 'renderAction') {
-                        renderActionCard(message.action);
-                    } else if (message.type === 'actionComplete') {
-                        const btn = document.getElementById('action-' + message.actionId);
-                        if (btn) {
-                            btn.innerText = '✓ 已完成';
-                            btn.disabled = true;
-                            btn.parentElement.style.opacity = '0.6';
-                        }
-                    } else if (message.type === 'toggleApproveAll') {
-                        globalActions.style.display = message.show ? 'block' : 'none';
-                    } else if (message.type === 'clearInput') {
-                        promptInput.value = '';
+                    const msg = event.data;
+                    switch (msg.type) {
+                        case 'addMessage':
+                            renderMessage(msg.message);
+                            break;
+                        case 'restoreHistory':
+                            chatHistory.innerHTML = '';
+                            msg.history.forEach(renderMessage);
+                            break;
+                        case 'clearChat':
+                            chatHistory.innerHTML = '';
+                            break;
+                        case 'actionComplete':
+                            markActionComplete(msg.actionId);
+                            break;
+                        case 'actionError':
+                            showActionError(msg.actionId, msg.error);
+                            break;
+                        case 'toggleApproveAll':
+                            globalActions.style.display = msg.show ? 'block' : 'none';
+                            break;
                     }
                 });
 
@@ -380,49 +494,83 @@ User Request: ${userInstruction}`;
                     vscode.postMessage({ type: 'approveAll' });
                 };
 
-                function addMessage(role, text) {
+                function renderMessage(message) {
+                    if (message.role === 'action') {
+                        renderActionCard(message.action);
+                        return;
+                    }
+                    
                     const div = document.createElement('div');
-                    div.className = 'message ' + role;
-                    div.innerText = text;
+                    div.className = 'message ' + message.role;
+                    
+                    if (message.role === 'ai' && window.marked) {
+                        div.innerHTML = marked.parse(message.text);
+                    } else {
+                        div.innerHTML = message.text;
+                    }
+                    
                     chatHistory.appendChild(div);
                     chatHistory.scrollTop = chatHistory.scrollHeight;
                 }
 
                 function renderActionCard(action) {
                     const card = document.createElement('div');
+                    card.id = 'card-' + action.id;
                     card.className = 'message ai';
                     card.style.borderLeft = '4px solid var(--vscode-button-background)';
                     card.innerHTML = \`
-                        <strong>待批准操作: \${action.type}</strong><br>
-                        \${action.path || action.command || action.url || ''}<br>
-                        <button id="action-\${action.id}" style="margin-top:5px; width:100%">批准并执行</button>
+                        <strong>待批准操作: \${action.type}<\/strong><br>
+                        <code>\${action.path || action.command || action.url || ''}<\/code><br>
+                        <button id="action-\${action.id}" style="margin-top:5px; width:100%">批准并执行<\/button>
+                        <div id="error-\${action.id}" class="action-error-text"><\/div>
                     \`;
                     chatHistory.appendChild(card);
-                    document.getElementById('action-' + action.id).onclick = () => {
+                    
+                    const btn = document.getElementById('action-' + action.id);
+                    btn.onclick = () => {
+                        document.getElementById('error-' + action.id).innerText = '';
                         vscode.postMessage({ type: 'approveAction', actionId: action.id });
                     };
                     chatHistory.scrollTop = chatHistory.scrollHeight;
                 }
 
-                // 按钮 1: 复制 Prompt
+                function markActionComplete(actionId) {
+                    const btn = document.getElementById('action-' + actionId);
+                    if (btn) {
+                        btn.innerText = '✓ 已完成';
+                        btn.disabled = true;
+                        btn.parentElement.style.opacity = '0.7';
+                    }
+                }
+                
+                function showActionError(actionId, errorMsg) {
+                    const errDiv = document.getElementById('error-' + actionId);
+                    if (errDiv) {
+                        errDiv.innerText = '执行错误: ' + errorMsg;
+                    }
+                }
+
                 document.getElementById('btn-copy').addEventListener('click', () => {
-                    const text = promptInput.value;
                     vscode.postMessage({
                         type: 'copyPrompt',
-                        inputValue: text
+                        inputValue: promptInput.value,
+                        options: {
+                            includeStructure: document.getElementById('chk-structure').checked,
+                            includeOpenFiles: document.getElementById('chk-files').checked
+                        }
                     });
                 });
 
-                // 按钮 2: 应用更改
                 document.getElementById('btn-apply').addEventListener('click', () => {
                     const text = promptInput.value;
+                    promptInput.value = '';
                     vscode.postMessage({
                         type: 'applyChange',
                         inputValue: text
                     });
                 });
-            </script>
-        </body>
-        </html>`;
+            <\/script>
+        <\/body>
+        <\/html>`;
     }
 }

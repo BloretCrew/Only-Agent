@@ -21,6 +21,13 @@
     "test": "node ./out/test/runTest.js"
   },
   "contributes": {
+    "commands": [
+      {
+        "command": "only-agent.clearHistory",
+        "title": "Clear History",
+        "icon": "$(clear-all)"
+      }
+    ],
     "viewsContainers": {
       "activitybar": [
         {
@@ -37,6 +44,15 @@
           "id": "Only-Agent.chatView",
           "icon": "Bloret.png",
           "name": "Chat"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "only-agent.clearHistory",
+          "when": "view == Only-Agent.chatView",
+          "group": "navigation"
         }
       ]
     }
