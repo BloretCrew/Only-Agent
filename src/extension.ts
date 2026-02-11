@@ -35,8 +35,17 @@ class ManualAIChatViewProvider implements vscode.WebviewViewProvider {
                 case 'copyPrompt': await this.handleCopyPrompt(data.inputValue); break;
                 case 'applyChange': await this.parseAndConfirmActions(data.inputValue); break;
                 case 'approveAction': await this.executeAction(data.actionId); break;
+                case 'approveAll': await this.handleApproveAll(); break;
             }
         });
+    }
+
+    private async handleApproveAll() {
+        const actionIds = this._pendingActions.map(a => a.id);
+        for (const id of actionIds) {
+            await this.executeAction(id);
+        }
+        this._view?.webview.postMessage({ type: 'toggleApproveAll', show: false });
     }
 
     private async getProjectStructure(): Promise<string> {
@@ -109,26 +118,21 @@ User Request: ${userInstruction}`;
     }
 
     private async parseAndConfirmActions(aiResponse: string) {
-        this._pendingActions = [];
-        // 允许标签前后有空格
+        // 不清空之前的，保留历史动作意识，但通常 apply 一次就是一个批次
+        const currentBatch: AgentAction[] = [];
         const actionRegex = /{{\s*TOOL_CALL:\s*(\w+)\s*}}([\s\S]*?)(?={{\s*TOOL_CALL:|$)/g;
         let match;
-        let foundAny = false;
 
         while ((match = actionRegex.exec(aiResponse)) !== null) {
-            foundAny = true;
             const type = match[1];
             const body = match[2];
             const id = Math.random().toString(36).substring(7);
-
             const action: AgentAction = { id, type: type as any };
 
-            // 更加宽松的提取逻辑，允许 AI 使用 **FILE:** 这种加粗格式，并忽略代码块标记后的后缀
             const getField = (body: string, field: string) => {
                 const reg = new RegExp(`(?:\\*\\*)?${field}:(?:\\*\\*)?\\s*(.*)`, 'i');
                 return body.match(reg)?.[1]?.trim();
             };
-
             const getCodeBlock = (body: string, field: string) => {
                 const reg = new RegExp(`(?:\\*\\*)?${field}:(?:\\*\\*)?\\s*[\\s\\S]*?\`\`\`[\\w]*\\n?([\\s\\S]*?)\\n?\`\`\``, 'i');
                 return body.match(reg)?.[1];
@@ -150,28 +154,35 @@ User Request: ${userInstruction}`;
             }
 
             if (action.type) {
+                currentBatch.push(action);
                 this._pendingActions.push(action);
                 this._view?.webview.postMessage({ type: 'renderAction', action });
             }
         }
 
-        if (!foundAny) {
+        if (currentBatch.length > 0) {
+            this._view?.webview.postMessage({ type: 'toggleApproveAll', show: true });
+        } else {
             this._view?.webview.postMessage({ 
                 type: 'addMessage', 
                 role: 'error', 
-                text: '❌ 未识别到任何有效的 TOOL_CALL 指令。请确保 AI 的回复包含类似 {{TOOL_CALL:MODIFY}} 的标签。' 
+                text: '❌ 未识别到有效的 TOOL_CALL 指令。' 
             });
         }
     }
 
     private async executeAction(actionId: string) {
-        const action = this._pendingActions.find(a => a.id === actionId);
-        if (!action) return;
+        const index = this._pendingActions.findIndex(a => a.id === actionId);
+        if (index === -1) return;
+        const action = this._pendingActions[index];
 
         try {
+            const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+            if (!workspaceRoot) throw new Error("未打开工作区");
+
             switch (action.type) {
                 case 'MODIFY':
-                    const doc = await vscode.workspace.openTextDocument(path.resolve(vscode.workspace.workspaceFolders![0].uri.fsPath, action.path!));
+                    const doc = await vscode.workspace.openTextDocument(path.resolve(workspaceRoot, action.path!));
                     const editor = await vscode.window.showTextDocument(doc);
                     const fullText = doc.getText();
                     const offset = fullText.indexOf(action.before!);
@@ -180,11 +191,11 @@ User Request: ${userInstruction}`;
                     }
                     break;
                 case 'CREATE':
-                    const newUri = vscode.Uri.file(path.resolve(vscode.workspace.workspaceFolders![0].uri.fsPath, action.path!));
+                    const newUri = vscode.Uri.file(path.resolve(workspaceRoot, action.path!));
                     await vscode.workspace.fs.writeFile(newUri, Buffer.from(action.content || ''));
                     break;
                 case 'DELETE':
-                    const delUri = vscode.Uri.file(path.resolve(vscode.workspace.workspaceFolders![0].uri.fsPath, action.path!));
+                    const delUri = vscode.Uri.file(path.resolve(workspaceRoot, action.path!));
                     await vscode.workspace.fs.delete(delUri);
                     break;
                 case 'SHELL':
@@ -193,10 +204,15 @@ User Request: ${userInstruction}`;
                     terminal.sendText(action.command!);
                     break;
                 case 'FETCH':
-                    vscode.env.openExternal(vscode.Uri.parse(action.url!));
+                    if (action.url) vscode.env.openExternal(vscode.Uri.parse(action.url));
                     break;
             }
+            this._pendingActions.splice(index, 1);
             this._view?.webview.postMessage({ type: 'actionComplete', actionId });
+            
+            if (this._pendingActions.length === 0) {
+                this._view?.webview.postMessage({ type: 'toggleApproveAll', show: false });
+            }
         } catch (e: any) {
             vscode.window.showErrorMessage(`执行失败: ${e.message}`);
         }
@@ -324,7 +340,10 @@ User Request: ${userInstruction}`;
             </div>
             
             <div id="input-area">
-                <textarea id="prompt-input" placeholder="在此输入你的需求，或者粘贴 AI 的回复..."></textarea>
+                <div id="global-actions" style="display: none; padding-bottom: 8px;">
+                    <button id="btn-approve-all" style="background-color: var(--vscode-statusBarItem-warningBackground); color: white; width: 100%;">全部批准执行 (Approve All)</button>
+                </div>
+                <textarea id="prompt-input" placeholder="输入需求或粘贴 AI 回复..."></textarea>
                 <div class="button-group">
                     <button id="btn-copy">Copy Prompt</button>
                     <button id="btn-apply">Apply Changes</button>
@@ -335,6 +354,7 @@ User Request: ${userInstruction}`;
                 const vscode = acquireVsCodeApi();
                 const chatHistory = document.getElementById('chat-history');
                 const promptInput = document.getElementById('prompt-input');
+                const globalActions = document.getElementById('global-actions');
 
                 window.addEventListener('message', event => {
                     const message = event.data;
@@ -343,12 +363,22 @@ User Request: ${userInstruction}`;
                     } else if (message.type === 'renderAction') {
                         renderActionCard(message.action);
                     } else if (message.type === 'actionComplete') {
-                        document.getElementById('action-' + message.actionId).innerText = '已执行';
-                        document.getElementById('action-' + message.actionId).disabled = true;
+                        const btn = document.getElementById('action-' + message.actionId);
+                        if (btn) {
+                            btn.innerText = '✓ 已完成';
+                            btn.disabled = true;
+                            btn.parentElement.style.opacity = '0.6';
+                        }
+                    } else if (message.type === 'toggleApproveAll') {
+                        globalActions.style.display = message.show ? 'block' : 'none';
                     } else if (message.type === 'clearInput') {
                         promptInput.value = '';
                     }
                 });
+
+                document.getElementById('btn-approve-all').onclick = () => {
+                    vscode.postMessage({ type: 'approveAll' });
+                };
 
                 function addMessage(role, text) {
                     const div = document.createElement('div');
