@@ -246,11 +246,51 @@ ${contextText}User Request: ${userInstruction}`;
                     const doc = await vscode.workspace.openTextDocument(path.resolve(workspaceRoot, action.path!));
                     const editor = await vscode.window.showTextDocument(doc);
                     const fullText = doc.getText();
+                    
+                    // 1. 尝试精确匹配
                     const offset = fullText.indexOf(action.before!);
                     if (offset !== -1) {
                         await editor.edit(e => e.replace(new vscode.Range(doc.positionAt(offset), doc.positionAt(offset + action.before!.length)), action.content!));
                     } else {
-                        throw new Error("找不到原文块，无法修改。");
+                        // 2. 尝试基于行的模糊匹配 (忽略首尾空行和每行的缩进)
+                        const docLines = fullText.split(/\r?\n/);
+                        const searchLines = action.before!.split(/\r?\n/);
+                        
+                        // 移除搜索块首尾的空行
+                        let startSearch = 0; 
+                        let endSearch = searchLines.length - 1;
+                        while (startSearch <= endSearch && searchLines[startSearch].trim() === '') startSearch++;
+                        while (endSearch >= startSearch && searchLines[endSearch].trim() === '') endSearch--;
+                        
+                        const effectiveSearchLines = searchLines.slice(startSearch, endSearch + 1);
+                        
+                        if (effectiveSearchLines.length === 0) {
+                             throw new Error("原文块为空或全是空白，无法匹配。");
+                        }
+
+                        let foundLineIndex = -1;
+                        for (let i = 0; i <= docLines.length - effectiveSearchLines.length; i++) {
+                            let match = true;
+                            for (let j = 0; j < effectiveSearchLines.length; j++) {
+                                if (docLines[i + j].trim() !== effectiveSearchLines[j].trim()) {
+                                    match = false;
+                                    break;
+                                }
+                            }
+                            if (match) {
+                                foundLineIndex = i;
+                                break;
+                            }
+                        }
+
+                        if (foundLineIndex !== -1) {
+                            const startPos = new vscode.Position(foundLineIndex, 0);
+                            const lastLineIndex = foundLineIndex + effectiveSearchLines.length - 1;
+                            const endPos = doc.lineAt(lastLineIndex).range.end;
+                            await editor.edit(e => e.replace(new vscode.Range(startPos, endPos), action.content!));
+                        } else {
+                            throw new Error("找不到原文块，无法修改。");
+                        }
                     }
                     break;
                 case 'CREATE':
